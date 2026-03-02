@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.pdb
+*.exp
+*.lib
+
+# Reports output
+output/SecurityReport_*.html
+
+# IDE
+.vscode/
+.vs/
+*.user
+
+# OS
+Thumbs.db
+.DS_Store
