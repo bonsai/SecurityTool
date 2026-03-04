@@ -1,20 +1,35 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    SecurityTool.ps1 - システムジャンク & 壊れたレジストリ 監視・修復ツール
+    SecurityTool.ps1 - システムジャンク、レジストリ、追加コンポーネントの監視・修復ツール
 
 .DESCRIPTION
-    SecurityEngine.dll (C++) を P/Invoke で呼び出し、以下の機能を提供します:
-      1. システムジャンクファイルのスキャン・クリーンアップ
-      2. 壊れた / 孤立したレジストリキーの検出・修復
-      3. HTML/テキスト形式のスキャンレポート生成
+    SecurityEngine.dll (C++) を P/Invoke で呼び出し、従来のジャンクファイル・レジストリ修復機能に加え、
+    Docker、機械学習モデルキャッシュ、追加のWindows保守機能のスキャン・クリーンアップを提供します。
 
 .PARAMETER Action
     scan       : スキャンのみ実行（デフォルト）
-    clean      : ジャンクファイルをクリーンアップ
+    cleanup    : ジャンクファイルや追加ターゲットをクリーンアップ
     fix        : レジストリ問題を修復
     full       : スキャン → クリーン → 修復 をすべて実行
     report     : スキャン結果を HTML レポートとして出力
+
+.PARAMETER Target
+    クリーンアップ対象を指定します (Actionがcleanupの場合のみ有効)。
+    junk          : 従来のシステムジャンクファイル (デフォルト)
+    docker        : Dockerの不要なコンテナ、イメージ、ボリューム
+    models        : 機械学習モデルのキャッシュ (HuggingFace, Torch, Pip)
+    windows_extra : Windows Updateキャッシュ、古いドライバなど
+    all           : 上記すべてを対象
+
+.PARAMETER DryRun
+    処理を実行せず、プレビューのみ表示します。
+
+.PARAMETER Confirm
+    各クリーンアップ処理の前に実行確認を求めます。
+
+.PARAMETER Aggressive
+    より積極的なクリーンアップを実行します (例: Dockerビルドキャッシュ全体)。
 
 .PARAMETER DllPath
     SecurityEngine.dll のパス（省略時はスクリプトと同じフォルダを検索）
@@ -23,15 +38,29 @@
     レポート出力先ディレクトリ（デフォルト: スクリプトと同じフォルダ）
 
 .EXAMPLE
-    .\SecurityTool.ps1 -Action scan
-    .\SecurityTool.ps1 -Action full
-    .\SecurityTool.ps1 -Action report -OutputDir C:\Reports
+    # Dockerのクリーンアップをプレビューのみ実行
+    .\SecurityTool.ps1 -Action cleanup -Target docker -DryRun
+
+    # MLキャッシュを対話的に確認しながら削除
+    .\SecurityTool.ps1 -Action cleanup -Target models -Confirm
+
+    # すべてのクリーンアップターゲットを非対話的に実行
+    .\SecurityTool.ps1 -Action cleanup -Target all
 #>
 
 [CmdletBinding()]
 param(
-    [ValidateSet('scan','clean','fix','full','report')]
+    [ValidateSet('scan','cleanup','fix','full','report')]
     [string]$Action = 'scan',
+
+    [ValidateSet('junk', 'registry', 'docker', 'models', 'windows_extra', 'all')]
+    [string]$Target = 'all',
+
+    [switch]$DryRun,
+
+    [switch]$Confirm,
+
+    [switch]$Aggressive,
 
     [string]$DllPath = '',
 
@@ -44,45 +73,60 @@ $ErrorActionPreference = 'Stop'
 # ============================================================
 # 定数・設定
 # ============================================================
-$TOOL_VERSION  = '1.0.0'
+$TOOL_VERSION  = '1.1.0' # バージョンアップ
 $MAX_JUNK      = 8192
 $MAX_REG       = 4096
 $SCRIPT_DIR    = Split-Path -Parent $MyInvocation.MyCommand.Path
+$logFile = "$env:USERPROFILE\Desktop\SecurityTool_Log_$(Get-Date -Format 'yyyyMMdd_HHmm').log"
 
 if ([string]::IsNullOrEmpty($DllPath)) {
-    $DllPath = Join-Path $SCRIPT_DIR 'SecurityEngine.dll'
+    # スクリプトの場所基準でDLLパスを解決
+    $potentialPath = Join-Path $SCRIPT_DIR "..\output\SecurityEngine.dll"
+    if(Test-Path $potentialPath) {
+        $DllPath = $potentialPath
+    } else {
+        $DllPath = Join-Path $SCRIPT_DIR 'SecurityEngine.dll' # フォールバック
+    }
 }
 if ([string]::IsNullOrEmpty($OutputDir)) {
     $OutputDir = $SCRIPT_DIR
 }
 
 # ============================================================
-# カラー出力ヘルパー
+# カラー出力ヘルパー & ロギング
 # ============================================================
+function Log { 
+    param([string]$msg, [string]$Level = 'Info')
+    $logMsg = "[$(Get-Date -Format 'HH:mm:ss')] [$Level] $msg"
+    Write-Host $logMsg
+    $logMsg | Out-File $logFile -Append
+}
+
 function Write-Header([string]$msg) {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host "  $msg" -ForegroundColor Cyan
-    Write-Host "$('=' * 60)" -ForegroundColor Cyan
+    $line = '=' * 60
+    Log "`n$line" 'Header'
+    Log "  $msg" 'Header'
+    Log $line 'Header'
 }
 
 function Write-Step([string]$msg) {
-    Write-Host "[*] $msg" -ForegroundColor Yellow
+    Log $msg 'Step'
 }
 
 function Write-OK([string]$msg) {
-    Write-Host "[+] $msg" -ForegroundColor Green
+    Log $msg 'OK'
 }
 
 function Write-Warn([string]$msg) {
-    Write-Host "[!] $msg" -ForegroundColor Red
+    Log $msg 'Warn'
 }
 
 function Write-Info([string]$msg) {
-    Write-Host "    $msg" -ForegroundColor Gray
+    Log $msg 'Detail'
 }
 
 # ============================================================
-# DLL の P/Invoke 型定義
+# DLL の P/Invoke 型定義 (既存のまま)
 # ============================================================
 function Initialize-DllTypes {
     param([string]$dllPath)
@@ -129,35 +173,35 @@ public struct ScanSummary {
 }
 
 public static class SecurityEngineNative {
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     public static extern int ScanJunkFiles([Out] JunkFileInfo[] buffer, int maxCount);
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CleanJunkFiles([In] JunkFileInfo[] items, int count, out long bytesFreed);
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     public static extern long GetTotalJunkSize();
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     public static extern int ScanRegistryIssues([Out] RegistryIssue[] buffer, int maxCount);
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool FixRegistryIssue([In] ref RegistryIssue issue);
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool FixAllRegistryIssues([In] RegistryIssue[] issues, int count, out int fixedCount);
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetScanSummary(out ScanSummary summary);
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr GetEngineVersion();
 
-    [DllImport(@"$($dllPath -replace '\\','\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
+    [DllImport(@"$($dllPath -replace '\\', '\\\\')", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsAdminPrivilege();
 }
@@ -183,8 +227,18 @@ function Get-SeverityLabel([int]$sev) {
     }
 }
 
+# 新規: フォルダサイズ計算を共通化
+function Get-FolderSizeMB {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return 0 }
+    try {
+        (Get-ChildItem $Path -Recurse -Force -ErrorAction SilentlyContinue |
+         Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum / 1MB
+    } catch { 0 }
+}
+
 # ============================================================
-# スキャン機能
+# スキャン機能 (既存のまま)
 # ============================================================
 function Invoke-JunkScan {
     Write-Step "ジャンクファイルをスキャン中..."
@@ -234,7 +288,7 @@ function Invoke-RegistryScan {
 }
 
 # ============================================================
-# クリーンアップ機能
+# クリーンアップ機能 (既存)
 # ============================================================
 function Invoke-JunkClean([array]$junkItems) {
     if ($junkItems.Count -eq 0) {
@@ -257,7 +311,7 @@ function Invoke-JunkClean([array]$junkItems) {
 }
 
 # ============================================================
-# レジストリ修復機能
+# レジストリ修復機能 (既存)
 # ============================================================
 function Invoke-RegistryFix([array]$issues) {
     if ($issues.Count -eq 0) {
@@ -280,7 +334,131 @@ function Invoke-RegistryFix([array]$issues) {
 }
 
 # ============================================================
-# HTML レポート生成
+# 新規: 追加クリーンアップ機能
+# ============================================================
+
+# Dockerクリーンアップ機能
+function Cleanup-Docker {
+    if (!(Get-Command docker -ErrorAction SilentlyContinue)) { 
+        Write-Warn "Dockerが見つかりません。スキップ。"
+        return 
+    }
+    
+    Write-Step "Docker クリーンアップ プレビュー"
+    $dockerDf = docker system df --format "{{.Type}}\t{{.TotalSize}}\t{{.Reclaimable}}"
+    $dockerDf | ForEach-Object { Write-Info $_ }
+
+    if ($Confirm) {
+        $proceed = Read-Host "Docker不要ファイルを削除しますか？ (Y/N)"
+        if ($proceed -notin 'Y','y') { 
+            Write-Warn "Dockerクリーンアップをスキップしました。"
+            return 
+        }
+    }
+
+    if (-not $DryRun) {
+        Write-Step "→ 実行: container prune"
+        docker container prune -f 2>&1 | ForEach-Object { Write-Info $_ }
+        
+        Write-Step "→ 実行: image prune"
+        docker image prune -f 2>&1 | ForEach-Object { Write-Info $_ }
+        
+        Write-Step "→ 実行: volume prune"
+        docker volume prune -f 2>&1 | ForEach-Object { Write-Info $_ }
+        
+        if ($Aggressive) {
+            Write-Step "→ Aggressive: builder prune 全キャッシュ"
+            docker builder prune -a -f 2>&1 | ForEach-Object { Write-Info $_ }
+        }
+        Write-OK "Dockerのクリーンアップが完了しました。"
+    } else {
+        Write-OK "[DryRun] Docker操作はスキップされました。"
+    }
+}
+
+# ML/モデルキャッシュクリーンアップ機能
+function Cleanup-Models {
+    Write-Step "ML/モデルキャッシュ プレビュー"
+    $mlPaths = @(
+        "$env:USERPROFILE\.cache\huggingface",
+        "$env:USERPROFILE\.cache\torch",
+        "$env:USERPROFILE\.cache\pip",
+        "$env:USERPROFILE\.cache\wandb",
+        "$env:USERPROFILE\.cache\mlflow"
+    )
+    $totalMb = 0
+    foreach ($p in $mlPaths) {
+        $size = Get-FolderSizeMB $p
+        if ($size -gt 0) { Write-Info ("$p : {0:N2} MB" -f $size) }
+        $totalMb += $size
+    }
+    Write-OK ("合計予定削除サイズ: {0:N2} MB" -f $totalMb)
+
+    if ($totalMb -lt 10) { 
+        Write-Info "削除対象が10MB未満のため、処理をスキップします。"
+        return
+    }
+
+    if ($Confirm) {
+        $proceed = Read-Host "MLキャッシュを削除しますか？ (Y/N)"
+        if ($proceed -notin 'Y','y') { 
+            Write-Warn "MLキャッシュのクリーンアップをスキップしました。"
+            return
+        }
+    }
+
+    if (-not $DryRun) {
+        foreach ($p in $mlPaths) {
+            if (Test-Path $p) {
+                Write-Step "削除: $p"
+                Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Write-OK "MLキャッシュのクリーンアップが完了しました。"
+    } else {
+        Write-OK "[DryRun] MLキャッシュの削除はスキップされました。"
+    }
+}
+
+# 拡張Windows保守機能
+function Cleanup-WindowsExtra {
+    Write-Step "拡張Windows保守 プレビュー"
+    
+    $wuPath = "C:\Windows\SoftwareDistribution\Download"
+    $wuMb = Get-FolderSizeMB $wuPath
+    Write-Info ("Windows Update ダウンロードキャッシュ: {0:N2} MB" -f $wuMb)
+
+    # DriverStoreは全削除が危険なため、プレビューのみに留め、手動操作を促す
+    Write-Info "DriverStore全体サイズは計算しません。必要に応じて `pnputil /enum-drivers` で確認してください。"
+
+    if ($Confirm) {
+        $proceed = Read-Host "Windows Updateキャッシュなどを削除しますか？ (Y/N)"
+        if ($proceed -notin 'Y','y') { 
+            Write-Warn "拡張Windows保守をスキップしました。"
+            return
+        }
+    }
+
+    if (-not $DryRun) {
+        Write-Step "→ Windows Update キャッシュ削除"
+        try {
+            Stop-Service -Name wuauserv -Force -ErrorAction Stop
+            Remove-Item "$wuPath\*" -Recurse -Force -ErrorAction SilentlyContinue
+        } finally {
+            Start-Service -Name wuauserv -ErrorAction SilentlyContinue
+        }
+
+        Write-Step "→ ディスク最適化 (C:)"
+        Optimize-Volume -DriveLetter C -ReTrim -Verbose 4>&1 | ForEach-Object { Write-Info $_ }
+        
+        Write-OK "拡張Windows保守が完了しました。"
+    } else {
+        Write-OK "[DryRun] 拡張Windows保守はスキップされました。"
+    }
+}
+
+# ============================================================
+# HTML レポート生成 (既存のまま)
 # ============================================================
 function New-HtmlReport {
     param(
@@ -312,7 +490,7 @@ function New-HtmlReport {
         "<tr>
             <td style='color:$sevColor;font-weight:bold'>$sevLabel</td>
             <td>$($_.IssueType)</td>
-            <td style='font-family:monospace;font-size:0.85em'>$($_.KeyPath)</td>
+            <td>$($_.KeyPath)</td>
             <td>$($_.ValueName)</td>
             <td>$($_.Description)</td>
         </tr>"
@@ -360,7 +538,7 @@ function New-HtmlReport {
     <div class="value">$(Format-Bytes $totalJunk)</div>
     <div class="label">ジャンク合計サイズ</div>
   </div>
-  <div class="card $(if($criticalReg -gt 0){'danger'}else{'warn'})">
+  <div class="card $(if($criticalReg -gt 0){'danger'}else{'warn'})" >
     <div class="value">$($RegIssues.Count)</div>
     <div class="label">レジストリ問題</div>
   </div>
@@ -402,27 +580,28 @@ function New-HtmlReport {
 # ============================================================
 # メイン処理
 # ============================================================
-Write-Header "SecurityTool v$TOOL_VERSION - システムジャンク & レジストリ監視"
+Write-Header "SecurityTool v$TOOL_VERSION - 拡張システムメンテナンスツール"
 
 # 管理者権限チェック
-$currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Warn "管理者権限なしで実行中です。一部の機能が制限される場合があります。"
-    Write-Warn "完全なスキャンには管理者として実行してください。"
 } else {
     Write-OK "管理者権限で実行中"
 }
 
-# DLL 型定義の読み込み
-Write-Step "SecurityEngine.dll を読み込み中: $DllPath"
-try {
-    Initialize-DllTypes -dllPath $DllPath
-    Write-OK "DLL 読み込み完了"
-} catch {
-    Write-Warn "DLL 読み込みエラー: $_"
-    Write-Warn "DLL が Windows 環境に存在することを確認してください。"
-    exit 1
+# DLL 型定義の読み込み (従来機能で必要な場合)
+if ($Action -in 'scan', 'clean', 'fix', 'full', 'report' -and $Target -in 'junk', 'registry', 'all') {
+    Write-Step "SecurityEngine.dll を読み込み中: $DllPath"
+    try {
+        Initialize-DllTypes -dllPath $DllPath
+        Write-OK "DLL 読み込み完了"
+    } catch {
+        Write-Warn "DLL 読み込みエラー: $_"
+        Write-Warn "DLL が Windows 環境に存在することを確認してください。"
+        # DLL必須のアクションでなければ続行
+        if ($Target -in 'junk', 'registry') { exit 1 }
+    }
 }
 
 # アクション実行
@@ -436,9 +615,15 @@ switch ($Action) {
         $junkItems = Invoke-JunkScan
         $regIssues = Invoke-RegistryScan
     }
-    'clean' {
-        $junkItems = Invoke-JunkScan
-        $freedBytes = Invoke-JunkClean $junkItems
+    'cleanup' {
+        Write-Step "クリーンアップ開始 - Target: $Target | DryRun: $DryRun | Confirm: $Confirm | Aggressive: $Aggressive"
+        if ($Target -in "all", "junk") { 
+            $junkItems = Invoke-JunkScan
+            $freedBytes = Invoke-JunkClean $junkItems
+        }
+        if ($Target -in "all", "docker") { Cleanup-Docker }
+        if ($Target -in "all", "models") { Cleanup-Models }
+        if ($Target -in "all", "windows_extra") { Cleanup-WindowsExtra }
     }
     'fix' {
         $regIssues = Invoke-RegistryScan
@@ -449,6 +634,9 @@ switch ($Action) {
         $regIssues  = Invoke-RegistryScan
         $freedBytes = Invoke-JunkClean $junkItems
         $fixedCount = Invoke-RegistryFix $regIssues
+        Cleanup-Docker
+        Cleanup-Models
+        Cleanup-WindowsExtra
     }
     'report' {
         $junkItems = Invoke-JunkScan
@@ -464,4 +652,4 @@ switch ($Action) {
 }
 
 Write-Header "処理完了"
-Write-OK "アクション '$Action' が正常に完了しました"
+Write-OK "アクション '$Action' が正常に完了しました。詳細はログファイルを確認してください: $logFile"
