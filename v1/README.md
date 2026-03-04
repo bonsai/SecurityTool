@@ -12,6 +12,19 @@ C++ DLLをコアエンジンとし、PowerShellスクリプトから呼び出す
 
 ## 使い方
 
+### KimuraSan.ps1 (常駐型クリーナー)
+
+v2(Go版)と同等の機能をPowerShellのみで実装した常駐型クリーナーです。
+
+```powershell
+# スクリプトを実行するとシステムトレイに常駐します
+.\scripts\KimuraSan.ps1
+```
+
+### SecurityTool.ps1 (CLIツール)
+
+従来通りのCLIツールです。
+
 ```powershell
 # ジャンクファイルとレジストリをスキャン
 .\scripts\SecurityTool.ps1 -Action scan
