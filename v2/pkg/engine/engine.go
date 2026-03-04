@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/bonsai/SecurityTool/go-security-tool/pkg/cleaner"
+	"github.com/bonsai/SecurityTool/v2/pkg/cleaner"
 )
 
 // ScanResult はスキャン結果を格納します。

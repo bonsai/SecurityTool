@@ -1,4 +1,4 @@
-module github.com/bonsai/SecurityTool/go-security-tool
+module github.com/bonsai/SecurityTool/v2
 
 go 1.22.1
 

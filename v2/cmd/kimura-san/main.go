@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bonsai/SecurityTool/go-security-tool/pkg/cleaner"
-	"github.com/bonsai/SecurityTool/go-security-tool/pkg/engine"
-	"github.com/bonsai/SecurityTool/go-security-tool/pkg/logger"
-	"github.com/bonsai/SecurityTool/go-security-tool/pkg/scheduler"
+	"github.com/bonsai/SecurityTool/v2/pkg/cleaner"
+	"github.com/bonsai/SecurityTool/v2/pkg/engine"
+	"github.com/bonsai/SecurityTool/v2/pkg/logger"
+	"github.com/bonsai/SecurityTool/v2/pkg/scheduler"
 
 	"github.com/getlantern/systray"
 	"github.com/go-toast/toast"
